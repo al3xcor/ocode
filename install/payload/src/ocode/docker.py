@@ -47,6 +47,7 @@ class CommandPreview:
     server_password: str | None = None
     reused: bool = False
     foreground_args: list[str] | None = None
+    wsl_keepalive: bool = False
 
     def powershell(self):
         def q(value):
@@ -635,6 +636,7 @@ def build_run_command(
         args,
         web_token=web_token,
         server_password=server_password,
+        wsl_keepalive=engine.is_wsl,
         foreground_args=(
             _tui_client_command(engine, project.container_name)
             if mode == "tui" else None
@@ -738,8 +740,12 @@ def launch_foreground(preview):
         if preview.foreground_args is not None:
             if preview.args:
                 launch_detached(preview)
+            elif preview.wsl_keepalive:
+                _ensure_wsl_keepalive()
             wait_for_backend(preview.foreground_args)
             return subprocess.call(preview.foreground_args)
+        if preview.wsl_keepalive:
+            _ensure_wsl_keepalive()
         return subprocess.call(preview.args)
     except FileNotFoundError as exc:
         raise DockerError("No se encuentra el motor de contenedores.") from exc
@@ -783,6 +789,8 @@ probe();
 
 def launch_detached(preview):
     try:
+        if preview.wsl_keepalive:
+            _ensure_wsl_keepalive()
         cp = subprocess.run(
             preview.args,
             check=True,
@@ -795,6 +803,15 @@ def launch_detached(preview):
         return cp.stdout.strip()
     except subprocess.CalledProcessError as exc:
         raise DockerError(exc.stdout or str(exc)) from exc
+
+
+def _ensure_wsl_keepalive() -> None:
+    from .wsl_keepalive import ensure_wsl_keepalive
+
+    try:
+        ensure_wsl_keepalive()
+    except RuntimeError as exc:
+        raise DockerError(str(exc)) from exc
 
 
 def container_status(cfg: GlobalConfig, name: str) -> str:
@@ -992,6 +1009,7 @@ def build_launch_command(*, paths, global_cfg, project, mode, detached):
         args = [] if running else ["start", name]
     return CommandPreview(
         engine.command + args if args else [], reused=True,
+        wsl_keepalive=engine.is_wsl,
         foreground_args=(
             _tui_client_command(engine, name)
             if mode == "tui" and existing_mode != "tui" else None
