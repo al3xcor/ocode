@@ -86,6 +86,10 @@ La selección queda guardada aunque la prueba falle. Puedes revisarla después
 desde **Motor** en el menú principal. ocode invoca los ejecutables del motor;
 no modifica aliases ni perfiles de PowerShell.
 
+Con Docker vía WSL, ocode mantiene una sesión WSL mientras haya contenedores
+gestionados en ejecución. La sesión se cierra automáticamente cuando ya no
+quedan instancias activas; no se modifican los ajustes globales de WSL.
+
 ## Añadir un proyecto o working copy
 
 En el menú principal, pulsa **Añadir**:
