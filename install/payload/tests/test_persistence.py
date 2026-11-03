@@ -1,5 +1,6 @@
 import ast
 from contextlib import ExitStack
+import json
 import subprocess
 import sys
 import unittest
@@ -13,6 +14,42 @@ sys.path.insert(0, str(SRC))
 from ocode import docker
 from ocode.model import ContainerRuntime, GlobalConfig, MAVEN_VERSION, ProjectConfig
 from ocode.paths import Paths
+from ocode.store import (
+    _ensure_provider_env,
+    provider_env_snippet,
+    provider_env_status,
+    project_overrides_providers,
+)
+
+
+def parse_jsonc(text: str):
+    """Quita comentarios JSONC fuera de cadenas y delega en `json`."""
+    result = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            end = index + 1
+            while end < len(text):
+                if text[end] == "\\":
+                    end += 2
+                elif text[end] == '"':
+                    end += 1
+                    break
+                else:
+                    end += 1
+            result.append(text[index:end])
+            index = end
+        elif text.startswith("//", index):
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = len(text) if end < 0 else end + 2
+        else:
+            result.append(char)
+            index += 1
+    return json.loads("".join(result))
 
 
 class OpenCodeV2DefaultsTests(unittest.TestCase):
@@ -59,6 +96,205 @@ class OpenCodeV2DefaultsTests(unittest.TestCase):
         self.assertIn('"permissions": [', config)
         self.assertNotIn('"permission": {', config)
         self.assertIn('"action": "glob"', config)
+
+
+class ProviderSeparationConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = TemporaryDirectory(dir=Path(__file__).parent)
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "opencode.jsonc"
+
+    def migrate(self, text: str):
+        self.path.write_text(text, encoding="utf-8")
+        self.assertIsNone(_ensure_provider_env(self.path))
+        updated = self.path.read_text(encoding="utf-8")
+        separated, detail = provider_env_status(self.path)
+        self.assertTrue(separated, detail)
+        return updated, parse_jsonc(updated)
+
+    def test_default_template_declares_go_env(self):
+        default = Path(__file__).resolve().parents[1] / "defaults" / "opencode.jsonc"
+        separated, detail = provider_env_status(default)
+        self.assertTrue(separated, detail)
+        data = parse_jsonc(default.read_text(encoding="utf-8"))
+        self.assertEqual(
+            data["providers"]["opencode-go"]["env"], ["OPENCODE_GO_API_KEY"]
+        )
+        self.assertNotIn("opencode", data["providers"])
+
+    def test_missing_providers_block_is_added_and_backup_created(self):
+        text = '{\n  "model": "opencode/demo"\n}\n'
+        updated, data = self.migrate(text)
+        self.assertEqual(data["model"], "opencode/demo")
+        self.assertEqual(
+            data["providers"]["opencode-go"]["env"], ["OPENCODE_GO_API_KEY"]
+        )
+        backup = self.path.with_name(self.path.name + ".bak-pre-0.12.2")
+        self.assertEqual(backup.read_text(encoding="utf-8"), text)
+        self.assertIn("opencode-go", updated)
+
+    def test_existing_providers_block_is_merged(self):
+        text = (
+            "{\n"
+            "  \"providers\": {\n"
+            "    \"openai\": { \"options\": { \"timeout\": 30 } }\n"
+            "  },\n"
+            "  \"model\": \"openai/gpt\"\n"
+            "}\n"
+        )
+        _, data = self.migrate(text)
+        self.assertEqual(data["model"], "openai/gpt")
+        self.assertEqual(data["providers"]["openai"]["options"]["timeout"], 30)
+        self.assertEqual(
+            data["providers"]["opencode-go"]["env"], ["OPENCODE_GO_API_KEY"]
+        )
+
+    def test_existing_go_entry_without_env_keeps_its_options(self):
+        text = (
+            "{\n"
+            "  \"providers\": {\n"
+            "    \"opencode-go\": {\n"
+            "      \"options\": { \"baseURL\": \"https://example.invalid\" },\n"
+            "      \"name\": \"Go\"\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+        _, data = self.migrate(text)
+        entry = data["providers"]["opencode-go"]
+        self.assertEqual(entry["options"]["baseURL"], "https://example.invalid")
+        self.assertEqual(entry["name"], "Go")
+        self.assertEqual(entry["env"], ["OPENCODE_GO_API_KEY"])
+
+    def test_wrong_env_is_replaced_exactly(self):
+        for env in (
+            '["OPENCODE_API_KEY"]',
+            '["OTRA", "OPENCODE_GO_API_KEY"]',
+            '"OPENCODE_GO_API_KEY"',
+        ):
+            with self.subTest(env=env):
+                text = (
+                    "{\n"
+                    "  \"providers\": {\n"
+                    f"    \"opencode-go\": {{ \"env\": {env} }}\n"
+                    "  }\n"
+                    "}\n"
+                )
+                _, data = self.migrate(text)
+                self.assertEqual(
+                    data["providers"]["opencode-go"]["env"],
+                    ["OPENCODE_GO_API_KEY"],
+                )
+
+    def test_correct_configuration_is_idempotent_and_has_no_backup(self):
+        text = (
+            "{\n"
+            "  \"providers\": {\n"
+            "    \"opencode-go\": { \"env\": [\"OPENCODE_GO_API_KEY\"] }\n"
+            "  }\n"
+            "}\n"
+        )
+        self.path.write_text(text, encoding="utf-8")
+        self.assertIsNone(_ensure_provider_env(self.path))
+        self.assertIsNone(_ensure_provider_env(self.path))
+        self.assertEqual(self.path.read_text(encoding="utf-8"), text)
+        self.assertFalse(
+            self.path.with_name(self.path.name + ".bak-pre-0.12.2").exists()
+        )
+
+    def test_empty_providers_object_is_filled(self):
+        text = '{\n  "providers": {\n  }\n}\n'
+        _, data = self.migrate(text)
+        self.assertEqual(
+            data["providers"]["opencode-go"]["env"], ["OPENCODE_GO_API_KEY"]
+        )
+
+    def test_comments_and_strings_are_preserved(self):
+        text = (
+            "{\n"
+            "  // Un comentario con } y // dentro\n"
+            "  \"model\": \"opencode/demo{A}\",\n"
+            "  \"providers\": {\n"
+            "    /* bloque */\n"
+            "    \"openai\": { \"env\": [\"OPENAI_API_KEY\"] }\n"
+            "  }\n"
+            "}\n"
+        )
+        updated, data = self.migrate(text)
+        self.assertIn("// Un comentario con } y // dentro", updated)
+        self.assertIn("/* bloque */", updated)
+        self.assertEqual(data["model"], "opencode/demo{A}")
+        self.assertEqual(
+            data["providers"]["openai"]["env"], ["OPENAI_API_KEY"]
+        )
+        self.assertEqual(
+            data["providers"]["opencode-go"]["env"], ["OPENCODE_GO_API_KEY"]
+        )
+
+    def test_trailing_comma_is_supported(self):
+        text = (
+            "{\n"
+            "  \"providers\": {\n"
+            "    \"openai\": { \"env\": [\"OPENAI_API_KEY\"] },\n"
+            "  },\n"
+            "}\n"
+        )
+        self.path.write_text(text, encoding="utf-8")
+        self.assertIsNone(_ensure_provider_env(self.path))
+        self.assertTrue(provider_env_status(self.path)[0])
+        updated = self.path.read_text(encoding="utf-8")
+        self.assertIn('"openai": { "env": ["OPENAI_API_KEY"] }', updated)
+        self.assertIn('"opencode-go": { "env": ["OPENCODE_GO_API_KEY"] }', updated)
+
+    def test_invalid_structures_are_left_untouched(self):
+        backup = self.path.with_name(self.path.name + ".bak-pre-0.12.2")
+        for text in (
+            '{ "providers": [] }\n',
+            '{ "providers": { "opencode-go": [] } }\n',
+            '{ "providers": "texto" }\n',
+            '{ "providers": { "opencode-go": {\n',
+        ):
+            with self.subTest(text=text):
+                backup.unlink(missing_ok=True)
+                self.path.write_text(text, encoding="utf-8")
+                self.assertIsNotNone(_ensure_provider_env(self.path))
+                self.assertEqual(self.path.read_text(encoding="utf-8"), text)
+                self.assertFalse(backup.exists())
+                self.assertFalse(provider_env_status(self.path)[0])
+
+    def test_existing_backup_is_never_overwritten(self):
+        backup = self.path.with_name(self.path.name + ".bak-pre-0.12.2")
+        backup.write_text("original", encoding="utf-8")
+        self.migrate('{ "model": "x" }\n')
+        self.assertEqual(backup.read_text(encoding="utf-8"), "original")
+
+    def test_status_reports_missing_file_and_block(self):
+        separated, detail = provider_env_status(self.path)
+        self.assertFalse(separated)
+        self.assertIn("No existe", detail)
+
+        self.path.write_text('{ "model": "x" }\n', encoding="utf-8")
+        separated, detail = provider_env_status(self.path)
+        self.assertFalse(separated)
+        self.assertIn("providers", detail)
+
+    def test_snippet_is_a_valid_providers_block(self):
+        snippet = provider_env_snippet()
+        self.assertEqual(
+            parse_jsonc("{" + snippet + "}")["providers"]["opencode-go"]["env"],
+            ["OPENCODE_GO_API_KEY"],
+        )
+
+    def test_project_config_override_is_detected(self):
+        project = Path(self.directory.name) / "project-opencode.jsonc"
+        project.write_text('{ "model": "opencode/demo" }\n', encoding="utf-8")
+        self.assertFalse(project_overrides_providers(project))
+        project.write_text(
+            '{ "providers": { "openai": {} } }\n', encoding="utf-8"
+        )
+        self.assertTrue(project_overrides_providers(project))
+        project.write_text('{ "providers": {\n', encoding="utf-8")
+        self.assertFalse(project_overrides_providers(project))
 
 
 class PersistenceTests(unittest.TestCase):

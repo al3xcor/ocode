@@ -360,11 +360,25 @@ en `auth.json`, y no aparece en la línea de comandos ni en **Comando Docker**.
 
 | Proveedor | Fichero | Variable | Prefijo de modelo |
 | --- | --- | --- | --- |
-| OpenCode Go | `config\secrets\opencode-go.env` | `OPENCODE_API_KEY` | `opencode-go/<modelo>` |
+| OpenCode Console | `config\secrets\opencode-console.env` | `OPENCODE_API_KEY` | `opencode/<modelo>` |
+| OpenCode Go | `config\secrets\opencode-go.env` | `OPENCODE_GO_API_KEY` | `opencode-go/<modelo>` |
 | OpenAI | `config\secrets\openai.env` | `OPENAI_API_KEY` | `openai/<modelo>` |
+| OpenRouter | `config\secrets\openrouter.env` | `OPENROUTER_API_KEY` | `openrouter/<modelo>` |
 
-La clave de OpenCode Go cubre también OpenCode Zen (`opencode/<modelo>`); el
-prefijo del modelo decide cuál se factura.
+OpenCode Console y OpenCode Go son proveedores independientes: cada uno usa su
+propio fichero y su propia variable, y una clave de uno nunca se inyecta como
+la del otro. Console funciona sin clave en modo gratuito; al configurarla, el
+uso se atribuye a la cuenta y se habilitan los modelos de pago. OpenCode Go
+requiere su clave de suscripción.
+
+`config\opencode.jsonc` declara `providers.opencode-go.env` con
+`OPENCODE_GO_API_KEY` para fijar la variable de Go y que no herede la de
+Console. Al actualizar desde una versión anterior, ocode migra la clave de Go a
+la nueva variable y añade ese bloque; si el archivo ya tenía un bloque
+`providers`, lo fusiona sin tocar el resto. Antes de modificarlo guarda
+`opencode.jsonc.bak-pre-0.12.2`. Si la estructura no se puede fusionar con
+seguridad, no modifica el archivo y Diagnóstico y Proveedores muestran el bloque
+exacto que hay que añadir a mano.
 
 Las claves son globales: todas las instancias comparten las mismas y no se
 admiten claves distintas por instancia. Los contenedores existentes conservan

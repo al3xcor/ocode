@@ -99,7 +99,9 @@ class ProvidersStorageTests(unittest.TestCase):
 
     def test_fingerprint_is_stable_and_changes_with_the_key(self):
         providers.save_key(self.paths, "opencode-go", KEY)
-        expected = hashlib.sha256(KEY.encode("utf-8")).hexdigest()[:12]
+        expected = hashlib.sha256(
+            f"OPENCODE_GO_API_KEY\0{KEY}".encode("utf-8")
+        ).hexdigest()[:12]
         self.assertEqual(
             providers.key_fingerprint(self.paths, "opencode-go"), expected
         )
@@ -111,10 +113,80 @@ class ProvidersStorageTests(unittest.TestCase):
             providers.key_fingerprint(self.paths, "opencode-go"), expected
         )
 
+    def test_fingerprint_includes_env_var_name(self):
+        providers.save_key(self.paths, "opencode", KEY)
+        providers.save_key(self.paths, "opencode-go", KEY)
+        self.assertNotEqual(
+            providers.key_fingerprint(self.paths, "opencode"),
+            providers.key_fingerprint(self.paths, "opencode-go"),
+        )
+
+    def test_console_and_go_use_separate_files_and_variables(self):
+        console = providers.PROVIDERS["opencode"]
+        go = providers.PROVIDERS["opencode-go"]
+        self.assertEqual(console.env_var, "OPENCODE_API_KEY")
+        self.assertEqual(go.env_var, "OPENCODE_GO_API_KEY")
+        self.assertNotEqual(console.filename, go.filename)
+
+        providers.save_key(self.paths, "opencode", KEY)
+        self.assertTrue(providers.key_configured(self.paths, "opencode"))
+        self.assertFalse(providers.key_configured(self.paths, "opencode-go"))
+        self.assertEqual(
+            self.env_file("opencode").read_bytes(),
+            f"OPENCODE_API_KEY={KEY}\n".encode("utf-8"),
+        )
+
+        providers.save_key(self.paths, "opencode-go", OTHER_KEY)
+        self.assertEqual(
+            self.env_file("opencode-go").read_bytes(),
+            f"OPENCODE_GO_API_KEY={OTHER_KEY}\n".encode("utf-8"),
+        )
+        self.assertEqual(providers.key_last4(self.paths, "opencode"), KEY[-4:])
+        self.assertEqual(
+            providers.key_last4(self.paths, "opencode-go"), OTHER_KEY[-4:]
+        )
+
+    def test_legacy_go_key_is_migrated_on_startup(self):
+        self.env_file("opencode-go").parent.mkdir(parents=True)
+        self.env_file("opencode-go").write_bytes(
+            f"OPENCODE_API_KEY={KEY}\n".encode("utf-8")
+        )
+        self.assertFalse(providers.key_configured(self.paths, "opencode-go"))
+
+        migrated = providers.migrate_legacy_keys(self.paths)
+        self.assertEqual(migrated, ["opencode-go"])
+        self.assertEqual(
+            self.env_file("opencode-go").read_bytes(),
+            f"OPENCODE_GO_API_KEY={KEY}\n".encode("utf-8"),
+        )
+        self.assertTrue(providers.key_configured(self.paths, "opencode-go"))
+        # El fichero de Console no se toca: no existía.
+        self.assertFalse(self.env_file("opencode").exists())
+
+    def test_legacy_migration_keeps_current_value_and_drops_legacy_line(self):
+        self.env_file("opencode-go").parent.mkdir(parents=True)
+        self.env_file("opencode-go").write_bytes(
+            (
+                f"OPENCODE_GO_API_KEY={KEY}\n"
+                f"OPENCODE_API_KEY={OTHER_KEY}\n"
+            ).encode("utf-8")
+        )
+        providers.migrate_legacy_keys(self.paths)
+        self.assertEqual(
+            self.env_file("opencode-go").read_bytes(),
+            f"OPENCODE_GO_API_KEY={KEY}\n".encode("utf-8"),
+        )
+
+    def test_legacy_migration_is_idempotent_and_ignores_other_files(self):
+        providers.save_key(self.paths, "opencode-go", KEY)
+        self.assertEqual(providers.migrate_legacy_keys(self.paths), [])
+        self.assertEqual(providers.migrate_legacy_keys(self.paths), [])
+        self.assertFalse(self.env_file("opencode").exists())
+
     def test_parser_tolerates_crlf_comments_and_blank_lines(self):
         self.env_file().parent.mkdir(parents=True)
         self.env_file().write_bytes(
-            b"# comentario\r\n\r\nOPENCODE_API_KEY=" + KEY.encode() + b"\r\n"
+            b"# comentario\r\n\r\nOPENCODE_GO_API_KEY=" + KEY.encode() + b"\r\n"
         )
         self.assertTrue(providers.key_configured(self.paths, "opencode-go"))
         self.assertEqual(providers.key_last4(self.paths, "opencode-go"), KEY[-4:])
@@ -125,10 +197,12 @@ class ProvidersStorageTests(unittest.TestCase):
             b"",
             b"# solo un comentario\n",
             b"OTRA_CLAVE=" + KEY.encode() + b"\n",
-            b"OPENCODE_API_KEY=short\n",
-            b"OPENCODE_API_KEY=" + KEY.encode() + b" \n",
-            b"\xef\xbb\xbfOPENCODE_API_KEY=" + KEY.encode() + b"\n",
+            b"OPENCODE_GO_API_KEY=short\n",
+            b"OPENCODE_GO_API_KEY=" + KEY.encode() + b" \n",
+            b"\xef\xbb\xbfOPENCODE_GO_API_KEY=" + KEY.encode() + b"\n",
             b"OPENAI_API_KEY=" + KEY.encode() + b"\n",
+            # La variable antigua ya no vale para Go sin migrar.
+            b"OPENCODE_API_KEY=" + KEY.encode() + b"\n",
         ):
             with self.subTest(content=content):
                 self.env_file().write_bytes(content)
@@ -187,6 +261,7 @@ class RunCommandTests(unittest.TestCase):
         self.assertNotIn(KEY, preview.powershell())
 
     def test_both_providers_are_injected(self):
+        providers.save_key(self.paths, "opencode", OTHER_KEY)
         providers.save_key(self.paths, "opencode-go", KEY)
         providers.save_key(self.paths, "openai", OTHER_KEY)
         args = self.build().args
@@ -194,19 +269,20 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual(
             self.env_files(args),
             [
-                str(self.paths.secrets_dir / providers.PROVIDERS["opencode-go"].filename),
-                str(self.paths.secrets_dir / providers.PROVIDERS["openai"].filename),
+                str(self.paths.secrets_dir / entry.filename)
+                for entry in (
+                    providers.PROVIDERS["opencode"],
+                    providers.PROVIDERS["opencode-go"],
+                    providers.PROVIDERS["openai"],
+                )
             ],
         )
-        self.assertIn(
-            "io.ocode.opencode-go="
-            f"{providers.key_fingerprint(self.paths, 'opencode-go')}",
-            args,
-        )
-        self.assertIn(
-            f"io.ocode.openai={providers.key_fingerprint(self.paths, 'openai')}",
-            args,
-        )
+        for provider_id in ("opencode", "opencode-go", "openai"):
+            self.assertIn(
+                f"{providers.PROVIDERS[provider_id].label}="
+                f"{providers.key_fingerprint(self.paths, provider_id)}",
+                args,
+            )
         for arg in args:
             self.assertNotIn(KEY, arg)
             self.assertNotIn(OTHER_KEY, arg)
@@ -222,7 +298,7 @@ class RunCommandTests(unittest.TestCase):
     def test_malformed_file_is_not_passed_to_docker(self):
         self.paths.secrets_dir.mkdir(parents=True)
         (self.paths.secrets_dir / providers.PROVIDERS["opencode-go"].filename).write_bytes(
-            b"OPENCODE_API_KEY=short\n"
+            b"OPENCODE_GO_API_KEY=short\n"
         )
         preview = self.build()
         self.assertNotIn("--env-file", preview.args)
@@ -317,6 +393,10 @@ class StaleLabelTests(unittest.TestCase):
 
 
 class ProvidersScreenTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def index_of(provider_id):
+        return list(providers.PROVIDERS).index(provider_id)
+
     def make_app(self, paths):
         cfg = GlobalConfig.defaults()
         cfg.container_runtime = ContainerRuntime(kind="docker")
@@ -344,7 +424,31 @@ class ProvidersScreenTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(
                         any(provider.name in text for text in texts)
                     )
+                    self.assertTrue(
+                        any(provider.hint in text for text in texts)
+                    )
                 self.assertFalse(screen.query(Input))
+                separation = screen.query_one("#provider-separation")
+                self.assertIn("Separaci", str(separation.content))
+                self.assertIn("providers", str(separation.content))
+
+    async def test_console_dialog_explains_free_mode_before_the_key(self):
+        with TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            paths = Paths(Path(directory))
+            app = self.make_app(paths)
+            async with app.run_test() as pilot:
+                dialog = ProviderKeyScreen("opencode")
+                app.push_screen(dialog)
+                await pilot.pause()
+                self.assertIn(
+                    "Modo gratuito",
+                    str(dialog.query_one("#provider-status").content),
+                )
+                self.assertIn(
+                    "opencode/<modelo>",
+                    str(dialog.query_one("#provider-hint").content),
+                )
+                self.assertTrue(dialog.query_one("#provider-description"))
 
     async def test_dialog_saves_and_clears_the_key(self):
         with TemporaryDirectory(dir=Path(__file__).parent) as directory:
@@ -356,7 +460,7 @@ class ProvidersScreenTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 view = screen.query_one("#providers-list", ListView)
-                view.index = 0
+                view.index = self.index_of("opencode-go")
                 view.focus()
                 await pilot.pause()
                 await pilot.press("enter")
@@ -381,7 +485,7 @@ class ProvidersScreenTests(unittest.IsolatedAsyncioTestCase):
                     "configurada",
                     str(
                         screen.query_one("#providers-list", ListView)
-                        .children[0]
+                        .children[self.index_of("opencode-go")]
                         .query_one("Label")
                         .content
                     ),
@@ -392,7 +496,7 @@ class ProvidersScreenTests(unittest.IsolatedAsyncioTestCase):
 
     async def open_dialog_and_clear(self, pilot, screen, app):
         view = screen.query_one("#providers-list", ListView)
-        view.index = 0
+        view.index = self.index_of("opencode-go")
         view.focus()
         await pilot.pause()
         await pilot.press("enter")
@@ -415,7 +519,7 @@ class ProvidersScreenTests(unittest.IsolatedAsyncioTestCase):
                 app.push_screen(screen)
                 await pilot.pause()
                 view = screen.query_one("#providers-list", ListView)
-                view.index = 1
+                view.index = self.index_of("openai")
                 view.focus()
                 await pilot.pause()
                 await pilot.press("enter")
