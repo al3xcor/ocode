@@ -1,5 +1,10 @@
 # Cambios
 
+## 0.12.2
+
+- Con Docker vía WSL, mantener una sesión propia mientras haya instancias de
+  ocode activas y liberarla automáticamente al detenerse la última.
+
 ## 0.12.1
 
 - Corregir la versión incluida en el paquete para que el actualizador reconozca
