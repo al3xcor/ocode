@@ -63,7 +63,7 @@ from .doctor import doctor
 from .storage import container_directories, storage_report
 from .model import ProjectConfig, format_build_paths, parse_build_paths, next_project_port
 from .paths import Paths
-from .store import Store
+from .store import Store, provider_env_snippet, provider_env_status
 from .update import Release, check_for_update, stage_update
 
 
@@ -1210,6 +1210,10 @@ class ProviderKeyScreen(ModalScreen[str | None]):
         background: $surface;
     }
     #provider-status { margin-bottom: 1; }
+    #provider-hint, #provider-description {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
     #provider-input { margin-bottom: 1; }
     #provider-actions { height: 3; }
     #provider-actions Button { width: 1fr; margin-right: 1; }
@@ -1222,6 +1226,11 @@ class ProviderKeyScreen(ModalScreen[str | None]):
     def compose(self) -> ComposeResult:
         with Vertical(id="provider-key"):
             yield Label(self.provider.name, classes="title")
+            yield Static(self.provider.hint, id="provider-hint", markup=False)
+            if self.provider.description:
+                yield Static(
+                    self.provider.description, id="provider-description", markup=False
+                )
             yield Static("", id="provider-status", markup=False)
             yield Input(
                 value="",
@@ -1242,7 +1251,12 @@ class ProviderKeyScreen(ModalScreen[str | None]):
     def refresh_status(self) -> None:
         status = self.query_one("#provider-status", Static)
         if not providers.key_configured(self.app.paths, self.provider.id):
-            status.update("Clave no configurada.")
+            suffix = (
+                " Modo gratuito: Console funciona sin clave."
+                if self.provider.id == "opencode"
+                else ""
+            )
+            status.update(f"Clave no configurada.{suffix}")
             return
         last4 = providers.key_last4(self.app.paths, self.provider.id)
         suffix = f" (…{last4})" if last4 else ""
@@ -1296,6 +1310,7 @@ class ProveedoresScreen(Screen):
         margin-bottom: 1;
     }
     #providers-list ListItem { padding: 0 1; }
+    #provider-separation { margin-bottom: 1; height: auto; }
     .section-title { text-style: bold; margin-bottom: 1; }
     """
 
@@ -1318,6 +1333,7 @@ class ProveedoresScreen(Screen):
                 classes="hint",
                 markup=False,
             )
+            yield Static("", id="provider-separation", markup=False)
             yield ListView(id="providers-list")
         yield Footer()
 
@@ -1325,6 +1341,7 @@ class ProveedoresScreen(Screen):
         await self.refresh_status()
 
     async def refresh_status(self) -> None:
+        self.refresh_separation()
         view = self.query_one("#providers-list", ListView)
         await view.clear()
         for entry in providers.PROVIDERS.values():
@@ -1332,14 +1349,35 @@ class ProveedoresScreen(Screen):
                 last4 = providers.key_last4(self.app.paths, entry.id)
                 suffix = f" (…{last4})" if last4 else ""
                 status = f"configurada{suffix}"
+            elif entry.id == "opencode":
+                status = "no configurada · modo gratuito"
             else:
                 status = "no configurada"
             view.append(
                 ListItem(
-                    Label(f"{entry.name} · {status}", markup=False),
+                    Label(
+                        f"{entry.name} · {entry.hint} · {status}",
+                        markup=False,
+                    ),
                     id=entry.id,
                 )
             )
+
+    def refresh_separation(self) -> None:
+        notice = self.query_one("#provider-separation", Static)
+        separated, detail = provider_env_status(self.app.paths.opencode_config)
+        if separated:
+            notice.update(
+                "Separación Console/Go: activa. OpenCode Go usa "
+                f"{providers.PROVIDERS['opencode-go'].env_var} y Console "
+                f"{providers.PROVIDERS['opencode'].env_var}."
+            )
+            return
+        notice.update(
+            f"Separación Console/Go: pendiente. {detail}\n"
+            "Añade este bloque a config\\opencode.jsonc y reinicia:\n"
+            + provider_env_snippet()
+        )
 
     @on(ListView.Selected, "#providers-list")
     def provider_selected(self, event: ListView.Selected) -> None:
@@ -1434,7 +1472,7 @@ class ProjectScreen(Screen):
     .section-help { height: auto; margin-bottom: 1; }
     #danger-zone { border: round $error; }
     #instance-status { height: auto; margin-bottom: 1; }
-    #go-stale-notice { height: auto; margin-bottom: 1; color: $warning; }
+    #provider-stale-notice { height: auto; margin-bottom: 1; color: $warning; }
     #navigation { height: auto; }
     #back { width: auto; margin-bottom: 1; }
     #top-actions { height: 3; align: right middle; }
@@ -1458,7 +1496,7 @@ class ProjectScreen(Screen):
         with VerticalScroll(id="instance-content"):
             yield Static(self._summary(), id="info", markup=False)
             yield Static("Estado: consultando...", id="instance-status", markup=False)
-            yield Static("", id="go-stale-notice", markup=False)
+            yield Static("", id="provider-stale-notice", markup=False)
             with Vertical(classes="action-group"):
                 yield Label("Uso", classes="section-title")
                 yield Static(
@@ -1538,7 +1576,7 @@ class ProjectScreen(Screen):
         if not self._exists():
             return
         status_widget = self.query_one("#instance-status", Static)
-        notice = self.query_one("#go-stale-notice", Static)
+        notice = self.query_one("#provider-stale-notice", Static)
         status_widget.update("Estado: consultando...")
         notice.update("")
         try:

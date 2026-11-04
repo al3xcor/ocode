@@ -4,6 +4,13 @@
   // Referencia al AGENTS global.
   "instructions": ["~/.config/opencode/AGENTS.md"],
 
+  // ocode: OpenCode Go usa su propia variable para no compartir la clave con
+  // OpenCode Console (opencode/<modelo>). Console conserva OPENCODE_API_KEY
+  // porque su lógica interna depende de ese nombre.
+  "providers": {
+    "opencode-go": { "env": ["OPENCODE_GO_API_KEY"] }
+  },
+
   // Las reglas se evalúan en orden; la última coincidencia prevalece.
   "permissions": [
     // Preguntas modales y skills.

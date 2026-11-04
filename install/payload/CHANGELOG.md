@@ -1,5 +1,27 @@
 # Cambios
 
+## 0.12.3
+
+- OpenCode Console (`opencode/<modelo>`) y OpenCode Go (`opencode-go/<modelo>`)
+  tienen claves independientes: Console conserva `OPENCODE_API_KEY` y Go pasa a
+  `OPENCODE_GO_API_KEY`, con ficheros `opencode-console.env` y
+  `opencode-go.env`.
+- OpenCode Console puede usarse sin clave en modo gratuito; con clave, el uso se
+  atribuye a la cuenta y se habilitan los modelos de pago. Es independiente de
+  OpenCode Go.
+- Se añade OpenRouter como proveedor (`openrouter/<modelo>`, variable
+  `OPENROUTER_API_KEY`, fichero `openrouter.env`), independiente de OpenAI.
+- Al actualizar, la clave existente de OpenCode Go se migra a la nueva variable
+  y la configuración global recibe `providers.opencode-go.env` aunque ya tuviera
+  un bloque `providers`. Se guarda una copia
+  `opencode.jsonc.bak-pre-0.12.2` antes de modificarla.
+- La huella de la clave incluye el nombre de la variable: los contenedores
+  creados antes del cambio se marcan como desactualizados.
+- Diagnóstico y Proveedores muestran la separación Console/Go y, si no se pudo
+  aplicar, el bloque exacto que hay que añadir a `config\opencode.jsonc`.
+- Un proyecto cuyo `opencode.jsonc` declara `providers` puede anular la
+  separación Console/Go; Diagnóstico lo avisa.
+
 ## 0.12.2
 
 - Con Docker vía WSL, mantener una sesión propia mientras haya instancias de
@@ -109,3 +131,5 @@
   y no adquieren acceso Web automáticamente.
 - Pruebas de regresión para concurrencia, colisiones no destructivas, cierre
   del cliente y operaciones limitadas a la instancia seleccionada.
+""", "path">
+C:\entorno_desarrollo\ocode\install\payload\CHANGELOG.md

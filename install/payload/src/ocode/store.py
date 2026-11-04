@@ -6,6 +6,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from . import providers
 from .model import GlobalConfig, ProjectConfig, SensitivePathsError
 from .paths import Paths
 
@@ -264,6 +265,290 @@ def _ensure_external_edit_rules(path: Path) -> None:
         shutil.copy2(path, backup)
     path.write_text(text, encoding="utf-8")
 
+def _skip_jsonc_space(text: str, index: int) -> int:
+    """Avanza espacios y comentarios JSONC sin interpretarlos."""
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char in " \t\r\n":
+            index += 1
+        elif text.startswith("//", index):
+            end = text.find("\n", index)
+            index = length if end < 0 else end + 1
+        elif text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+        else:
+            break
+    return index
+
+
+def _jsonc_string_end(text: str, index: int) -> int:
+    """Índice justo después de la cadena que empieza en `index`."""
+    index += 1
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+        elif char == '"':
+            return index + 1
+        else:
+            index += 1
+    raise RuntimeError("Cadena sin cerrar")
+
+
+def _jsonc_value_end(text: str, index: int) -> int:
+    """Índice justo después del valor JSONC que empieza en `index`."""
+    if index >= len(text):
+        raise RuntimeError("JSONC incompleto")
+    char = text[index]
+    if char == '"':
+        return _jsonc_string_end(text, index)
+    if char in "{[":
+        depth = 0
+        while index < len(text):
+            char = text[index]
+            if char == '"':
+                index = _jsonc_string_end(text, index)
+                continue
+            if text.startswith("//", index):
+                end = text.find("\n", index)
+                index = len(text) if end < 0 else end + 1
+                continue
+            if text.startswith("/*", index):
+                end = text.find("*/", index + 2)
+                index = len(text) if end < 0 else end + 2
+                continue
+            if char in "{[":
+                depth += 1
+            elif char in "}]":
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+            index += 1
+        raise RuntimeError("Objeto o array sin cerrar")
+    while index < len(text) and text[index] not in ",}] \t\r\n":
+        index += 1
+    return index
+
+
+def _jsonc_members(text: str, opening: int, closing: int):
+    """Recorre los miembros directos del objeto `text[opening:closing + 1]`."""
+    index = _skip_jsonc_space(text, opening + 1)
+    while index < closing:
+        if text[index] != '"':
+            raise RuntimeError("Clave JSONC no válida")
+        key_end = _jsonc_string_end(text, index)
+        key = text[index + 1:key_end - 1]
+        index = _skip_jsonc_space(text, key_end)
+        if index >= closing or text[index] != ":":
+            raise RuntimeError(f"Falta ':' tras la clave \"{key}\"")
+        value_start = _skip_jsonc_space(text, index + 1)
+        value_end = _jsonc_value_end(text, value_start)
+        yield key, value_start, value_end
+        index = _skip_jsonc_space(text, value_end)
+        if index < closing and text[index] == ",":
+            index = _skip_jsonc_space(text, index + 1)
+        elif index < closing and text[index] != "}":
+            raise RuntimeError(f"Falta ',' tras la clave \"{key}\"")
+
+
+def _jsonc_root(text: str) -> tuple[int, int]:
+    """Posiciones de las llaves que abren y cierran el objeto raíz."""
+    opening = _skip_jsonc_space(text, 0)
+    if opening >= len(text) or text[opening] != "{":
+        raise RuntimeError("La configuración no es un objeto JSONC")
+    closing = _jsonc_value_end(text, opening) - 1
+    if text[closing] != "}":
+        raise RuntimeError("Objeto raíz sin cerrar")
+    return opening, closing
+
+
+def _jsonc_key_span(
+    text: str, opening: int, closing: int, key: str
+) -> tuple[int, int] | None:
+    """Tramo `(inicio, fin)` del valor de `key` en el objeto indicado."""
+    found = None
+    for name, value_start, value_end in _jsonc_members(text, opening, closing):
+        if name != key:
+            continue
+        if found is not None:
+            raise RuntimeError(f'La clave "{key}" está duplicada')
+        found = (value_start, value_end)
+    return found
+
+
+def _jsonc_string_array(text: str, start: int, end: int) -> list[str] | None:
+    """Contenido de un array de cadenas, o None si no lo es."""
+    if start >= end or text[start] != "[":
+        return None
+    values = []
+    index = _skip_jsonc_space(text, start + 1)
+    while index < end - 1:
+        if text[index] != '"':
+            return None
+        stop = _jsonc_string_end(text, index)
+        values.append(text[index + 1:stop - 1])
+        index = _skip_jsonc_space(text, stop)
+        if index < end - 1 and text[index] == ",":
+            index = _skip_jsonc_space(text, index + 1)
+        elif index < end - 1:
+            return None
+    return values
+
+
+def _jsonc_last_value_end(text: str, opening: int, closing: int) -> int | None:
+    last = None
+    for _, _, value_end in _jsonc_members(text, opening, closing):
+        last = value_end
+    return last
+
+
+def _jsonc_insert_member(
+    text: str,
+    opening: int,
+    closing: int,
+    block: str,
+    empty_suffix: str,
+) -> str:
+    """Añade `block` como último miembro sin tocar el resto del texto."""
+    last = _jsonc_last_value_end(text, opening, closing)
+    if last is None:
+        return text[:opening + 1] + block + empty_suffix + text[opening + 1:]
+
+    index = _skip_jsonc_space(text, last)
+    if index < closing and text[index] == ",":
+        following = _skip_jsonc_space(text, index + 1)
+        if following >= closing:
+            # Coma final: el bloque entra después y no necesita otra.
+            return text[:index + 1] + block + text[index + 1:]
+        return text[:index + 1] + block + "," + text[index + 1:]
+    return text[:last] + "," + block + text[last:]
+
+
+def provider_env_snippet() -> str:
+    """Bloque que separa la clave de OpenCode Go de la de Console."""
+    env_var = providers.PROVIDERS["opencode-go"].env_var
+    return (
+        '"providers": {\n'
+        f'  "opencode-go": {{ "env": ["{env_var}"] }}\n'
+        "}"
+    )
+
+
+def _with_provider_env(text: str) -> str:
+    """Devuelve el JSONC con la variable propia de OpenCode Go, o el mismo texto."""
+    env_var = providers.PROVIDERS["opencode-go"].env_var
+    root = _jsonc_root(text)
+    span = _jsonc_key_span(text, *root, "providers")
+
+    if span is None:
+        block = (
+            "\n  // ocode: OpenCode Go usa su propia variable para no compartir\n"
+            "  // la clave con OpenCode Console (opencode/<modelo>).\n"
+            '  "providers": {\n'
+            f'    "opencode-go": {{ "env": ["{env_var}"] }}\n'
+            "  }"
+        )
+        return _jsonc_insert_member(text, *root, block, "\n")
+
+    if text[span[0]] != "{":
+        raise RuntimeError('El campo "providers" no es un objeto')
+    provider_object = (span[0], span[1] - 1)
+
+    entry = _jsonc_key_span(text, *provider_object, "opencode-go")
+    if entry is None:
+        block = f'\n    "opencode-go": {{ "env": ["{env_var}"] }}'
+        return _jsonc_insert_member(text, *provider_object, block, "\n  ")
+
+    if text[entry[0]] != "{":
+        raise RuntimeError('El campo "providers.opencode-go" no es un objeto')
+
+    env = _jsonc_key_span(text, entry[0], entry[1] - 1, "env")
+    if env is None:
+        block = f'\n      "env": ["{env_var}"]'
+        return _jsonc_insert_member(text, entry[0], entry[1] - 1, block, "\n    ")
+
+    if _jsonc_string_array(text, *env) == [env_var]:
+        return text
+    return text[:env[0]] + f'["{env_var}"]' + text[env[1]:]
+
+
+def _ensure_provider_env(path: Path) -> str | None:
+    """Añade la variable propia de Go a la config, respetando la del usuario.
+
+    Devuelve un mensaje cuando la estructura existente no se puede fusionar con
+    seguridad. En ese caso el fichero no se modifica.
+    """
+    if not path.exists():
+        return None
+
+    try:
+        text = path.read_text(encoding="utf-8")
+        updated = _with_provider_env(text)
+    except (OSError, UnicodeError) as exc:
+        return f"No se pudo leer {path.name}: {exc}"
+    except RuntimeError as exc:
+        return f"{path.name}: {exc}"
+
+    if updated == text:
+        return None
+
+    try:
+        backup = path.with_name(path.name + ".bak-pre-0.12.2")
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        path.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        return f"No se pudo actualizar {path.name}: {exc}"
+    return None
+
+
+def provider_env_status(path: Path) -> tuple[bool, str]:
+    """Comprueba que la config global separa la clave de Go de la de Console."""
+    env_var = providers.PROVIDERS["opencode-go"].env_var
+    if not path.exists():
+        return False, f"No existe {path}."
+    try:
+        text = path.read_text(encoding="utf-8")
+        root = _jsonc_root(text)
+        span = _jsonc_key_span(text, *root, "providers")
+        if span is None:
+            return False, 'La configuración no declara el bloque "providers".'
+        if text[span[0]] != "{":
+            return False, 'El campo "providers" no es un objeto.'
+        entry = _jsonc_key_span(text, span[0], span[1] - 1, "opencode-go")
+        if entry is None:
+            return False, 'Falta la entrada "providers.opencode-go".'
+        if text[entry[0]] != "{":
+            return False, 'El campo "providers.opencode-go" no es un objeto.'
+        env = _jsonc_key_span(text, entry[0], entry[1] - 1, "env")
+        if env is None:
+            return False, 'Falta "providers.opencode-go.env".'
+        if _jsonc_string_array(text, *env) != [env_var]:
+            return False, (
+                f'"providers.opencode-go.env" debe ser exactamente ["{env_var}"].'
+            )
+        return True, ""
+    except (OSError, UnicodeError) as exc:
+        return False, f"No se pudo leer {path.name}: {exc}"
+    except RuntimeError as exc:
+        return False, f"{path.name}: {exc}"
+
+
+def project_overrides_providers(path: Path) -> bool:
+    """True si un opencode.jsonc de proyecto declara `providers`."""
+    try:
+        text = path.read_text(encoding="utf-8")
+        root = _jsonc_root(text)
+    except (OSError, UnicodeError, RuntimeError):
+        return False
+    try:
+        return _jsonc_key_span(text, *root, "providers") is not None
+    except RuntimeError:
+        return False
+
+
 def _project_folder_base(name: str, branch: str) -> str:
     raw = f"{name}-{branch}".strip()
     # Windows-invalid filename characters and control chars.
@@ -333,6 +618,7 @@ class Store:
 
     def initialize(self) -> GlobalConfig:
         self.paths.ensure_dirs()
+        providers.migrate_legacy_keys(self.paths)
         self._migrate_project_directories()
 
         for path in (
@@ -363,6 +649,7 @@ class Store:
         self._install_default_skills()
         _ensure_project_skills_source(self.paths.opencode_config)
         _ensure_external_edit_rules(self.paths.opencode_config)
+        _ensure_provider_env(self.paths.opencode_config)
 
         # Keep user configuration, but append mandatory ocode sensitive denies
         # if this installation predates them.

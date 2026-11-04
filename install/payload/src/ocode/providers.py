@@ -23,16 +23,39 @@ class Provider:
     filename: str
     label: str
     hint: str
+    description: str = ""
+    legacy_env_var: str | None = None
 
 
 PROVIDERS: dict[str, Provider] = {
+    # OpenCode Console exige su clave en OPENCODE_API_KEY: su lógica interna
+    # (`hasKey`) y el transporte HTTP usan ese nombre fijo. Sin clave funciona
+    # en modo gratuito; con clave atribuye el uso a la cuenta.
+    "opencode": Provider(
+        id="opencode",
+        name="OpenCode Console",
+        env_var="OPENCODE_API_KEY",
+        filename="opencode-console.env",
+        label="io.ocode.opencode",
+        hint="opencode/<modelo>",
+        description=(
+            "Sin clave funciona en modo gratuito. Con clave, el uso se atribuye "
+            "a tu cuenta y se habilitan los modelos de pago. Es independiente "
+            "de OpenCode Go."
+        ),
+    ),
     "opencode-go": Provider(
         id="opencode-go",
         name="OpenCode Go",
-        env_var="OPENCODE_API_KEY",
+        env_var="OPENCODE_GO_API_KEY",
         filename="opencode-go.env",
         label="io.ocode.opencode-go",
         hint="opencode-go/<modelo>",
+        description=(
+            "Suscripción Go. Usa una variable y un fichero propios; no comparte "
+            "clave con OpenCode Console."
+        ),
+        legacy_env_var="OPENCODE_API_KEY",
     ),
     "openai": Provider(
         id="openai",
@@ -41,6 +64,19 @@ PROVIDERS: dict[str, Provider] = {
         filename="openai.env",
         label="io.ocode.openai",
         hint="openai/<modelo>",
+        description="Acceso directo a OpenAI con tu propia clave.",
+    ),
+    "openrouter": Provider(
+        id="openrouter",
+        name="OpenRouter",
+        env_var="OPENROUTER_API_KEY",
+        filename="openrouter.env",
+        label="io.ocode.openrouter",
+        hint="openrouter/<modelo>",
+        description=(
+            "Acceso a múltiples modelos de distintos proveedores a través de "
+            "OpenRouter con tu propia clave."
+        ),
     ),
 }
 
@@ -67,7 +103,11 @@ def key_fingerprint(paths, provider_id: str) -> str | None:
     key = _read_key(env_file(paths, provider_id), provider(provider_id).env_var)
     if key is None:
         return None
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    entry = provider(provider_id)
+    # El nombre de la variable forma parte de la huella: renombrarla obliga a
+    # recrear el contenedor aunque la clave no cambie.
+    payload = f"{entry.env_var}\0{key}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:12]
 
 
 def key_last4(paths, provider_id: str) -> str | None:
@@ -81,13 +121,48 @@ def save_key(paths, provider_id: str, key: str) -> None:
     """Valida y guarda la clave de forma atómica. Nunca incluye la clave en errores."""
     entry = provider(provider_id)
     value = _validate(key)
-    path = env_file(paths, provider_id)
+    _write_key_file(env_file(paths, provider_id), entry.env_var, value)
+
+
+def migrate_legacy_keys(paths) -> list[str]:
+    """Renombra variables antiguas en los ficheros de entorno de ocode.
+
+    OpenCode Go usaba `OPENCODE_API_KEY`, el mismo nombre que OpenCode Console
+    necesita. Si se dejara así, el contenedor recibiría una clave de Go con el
+    nombre de Console y ambas dejarían de ser independientes. La reescritura es
+    atómica y elimina la variable antigua aunque ya exista la nueva. No se crea
+    copia de seguridad: duplicaría el secreto.
+    """
+    migrated = []
+    for entry in PROVIDERS.values():
+        if not entry.legacy_env_var:
+            continue
+        path = env_file(paths, entry.id)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            continue
+
+        current = _read_key(path, entry.env_var)
+        legacy = _read_key(path, entry.legacy_env_var)
+        value = current or legacy
+        if value is None:
+            continue
+        if current is not None and entry.legacy_env_var not in _declared_vars(text):
+            continue
+
+        _write_key_file(path, entry.env_var, value)
+        migrated.append(entry.id)
+    return migrated
+
+
+def _write_key_file(path: Path, env_var: str, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd, temp_name = tempfile.mkstemp(prefix=f".{entry.id}-", dir=path.parent)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(f"{entry.env_var}={value}\n")
+            handle.write(f"{env_var}={value}\n")
         _restrict_permissions(Path(temp_name))
         os.replace(temp_name, path)
     finally:
@@ -121,6 +196,18 @@ def _validate(key: str) -> str:
             "La clave no puede contener espacios ni caracteres de control."
         )
     return value
+
+
+def _declared_vars(text: str) -> set[str]:
+    """Nombres de variable declarados en un fichero de entorno, sin valores."""
+    names = set()
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        name, separator, _ = line.partition("=")
+        if separator:
+            names.add(name)
+    return names
 
 
 def _read_key(path: Path, env_var: str) -> str | None:
