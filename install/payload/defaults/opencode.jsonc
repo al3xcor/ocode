@@ -21,6 +21,7 @@
     { "action": "external_directory", "resource": "*", "effect": "deny" },
     { "action": "external_directory", "resource": "~/.jdks/**", "effect": "allow" },
     { "action": "external_directory", "resource": "/tmp/**", "effect": "allow" },
+	{ "action": "external_directory", "resource": "/etc/ocode/*", "effect": "allow" },
     { "action": "external_directory", "resource": "/etc/ocode/project-skills/*", "effect": "allow" },
     { "action": "external_directory", "resource": "/etc/ocode/project-AGENTS.md", "effect": "allow" },
 
@@ -65,6 +66,7 @@
     { "action": "read", "resource": "*/credentials", "effect": "deny" },
     { "action": "read", "resource": "*/credentials.*", "effect": "deny" },
     { "action": "read", "resource": "*.properties", "effect": "deny" },
+	{ "action": "read", "resource": "wseganadero/src/main/resources/messages_es.properties", "effect": "allow" },
     { "action": "read", "resource": "*application*.yml", "effect": "deny" },
     { "action": "read", "resource": "*application*.yaml", "effect": "deny" },
     { "action": "read", "resource": "*bootstrap*.yml", "effect": "deny" },
@@ -200,5 +202,6 @@
     "ignore": ["**/target/**", "**/node_modules/**", "**/dist/**", "**/build/**"]
   },
 
-  "skills": ["/etc/ocode/project-skills"]
+  "skills": ["/etc/ocode/project-skills"],
+  "agents": ["/etc/ocode/project-AGENTS.md"]
 }
